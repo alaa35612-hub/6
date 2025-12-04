@@ -238,14 +238,21 @@ def _normalize_symbol(exchange: ccxt.Exchange, symbol: str) -> Optional[str]:
 
 
 def get_symbols(exchange: ccxt.Exchange) -> List[str]:
-    markets = exchange.load_markets()
+    """Return the set of Binance USDT-M swap symbols to scan."""
+
+    markets = exchange.markets if exchange.markets else exchange.load_markets()
+
     if USE_ALL_SYMBOLS:
-        # Only include USDT-margined swap contracts
-        return [
+        symbols = [
             s
             for s, m in markets.items()
-            if m.get("quote") == "USDT" and m.get("swap") and m.get("contract")
+            if m.get("quote") == "USDT"
+            and m.get("swap")
+            and m.get("contract")
+            and (m.get("linear") or m.get("future"))
         ]
+        # Binance lists both with and without ":USDT" suffix; deduplicate to avoid double scans
+        return sorted(list(dict.fromkeys(symbols)))
 
     resolved = []
     for sym in SYMBOLS_WHITELIST:
