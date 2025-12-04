@@ -24,6 +24,10 @@ ALERT_LOOKBACK_BARS = 3
 ALERT_LOOKBACK_MINUTES = 60
 SCAN_INTERVAL_SECONDS = 0  # 0 to run single pass
 
+# Track the latest processed candle timestamp per symbol/timeframe to avoid
+# re-emitting stale alerts across scan iterations.
+LAST_SCANNED_TS: Dict[Tuple[str, str], int] = {}
+
 # Pine inputs translated to Python defaults
 showLine = True
 biasUpAlert = True
@@ -594,7 +598,13 @@ def process_htf_fvgs(htf_context: Dict[str, pd.DataFrame]):
     return structures
 
 
-def process_symbol(symbol: str, timeframe: str, df: pd.DataFrame, htf_context: Optional[Dict[str, pd.DataFrame]] = None) -> List[Dict]:
+def process_symbol(
+    symbol: str,
+    timeframe: str,
+    df: pd.DataFrame,
+    htf_context: Optional[Dict[str, pd.DataFrame]] = None,
+    last_processed_ts: Optional[int] = None,
+) -> List[Dict]:
     signals = []
     if htf_context is not None:
         process_htf_fvgs(htf_context)
@@ -620,6 +630,15 @@ def process_symbol(symbol: str, timeframe: str, df: pd.DataFrame, htf_context: O
     latest_index = len(df) - 1
     cutoff_index = max(0, latest_index - ALERT_LOOKBACK_BARS)
     cutoff_time = df.loc[df.index[latest_index], "timestamp"] - ALERT_LOOKBACK_MINUTES * 60 * 1000 if ALERT_LOOKBACK_MINUTES else 0
+
+    # Only evaluate bars newer than the last processed timestamp to avoid
+    # replaying historical alerts.
+    if last_processed_ts is not None:
+        newer = df.index[df["timestamp"] > last_processed_ts]
+        if len(newer) == 0:
+            return []
+        first_new_pos = df.index.get_loc(newer[0])
+        cutoff_index = max(cutoff_index, first_new_pos)
 
     for i in range(cutoff_index, len(df)):
         ts = df.loc[df.index[i], "timestamp"]
@@ -666,7 +685,10 @@ def main():
                 except Exception as exc:  # noqa: BLE001
                     logging.warning("Fetch failed for %s %s: %s", symbol, tf, exc)
                     continue
-                signals = process_symbol(symbol, tf, df, htf_context)
+                key = (symbol, tf)
+                last_ts = LAST_SCANNED_TS.get(key)
+                signals = process_symbol(symbol, tf, df, htf_context, last_processed_ts=last_ts)
+                LAST_SCANNED_TS[key] = int(df["timestamp"].iloc[-1])
                 for sig in signals:
                     logging.info("%s, %s, %s, %.4f, %s", sig["symbol"], sig["timeframe"], sig["signal"], sig["price"], sig["time"])
 
