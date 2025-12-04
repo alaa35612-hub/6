@@ -17,6 +17,8 @@ EXCHANGE_ID = "binanceusdm"
 USE_ALL_SYMBOLS = True
 SYMBOLS_WHITELIST = ["BTC/USDT", "ETH/USDT"]
 SCAN_TIMEFRAMES = ["5m", "15m", "1h"]
+# HTF FVG timeframes are configured separately from the scan timeframes
+HTF_FVG_TIMEFRAMES = ["5m", "15m", "1h"]
 MAX_HISTORY_BARS = 500
 ALERT_LOOKBACK_BARS = 3
 ALERT_LOOKBACK_MINUTES = 60
@@ -44,9 +46,8 @@ settings_padding = 4
 settings_buffer = 6
 
 HTF_SETTINGS_DEFAULTS = [
-    {"show": True, "htf": "5", "color_bull": (0, 255, 0, 90), "color_bear": (0, 0, 255, 90), "max_count": 20},
-    {"show": True, "htf": "15", "color_bull": (0, 255, 0, 90), "color_bear": (0, 0, 255, 90), "max_count": 20},
-    {"show": True, "htf": "60", "color_bull": (0, 255, 0, 90), "color_bear": (0, 0, 255, 90), "max_count": 20},
+    {"show": True, "htf": tf, "color_bull": (0, 255, 0, 90), "color_bear": (0, 0, 255, 90), "max_count": 20}
+    for tf in HTF_FVG_TIMEFRAMES
 ]
 
 # LuxAlgo Imbalance settings
@@ -262,6 +263,18 @@ def fetch_ohlcv_dataframe(exchange: ccxt.Exchange, symbol: str, timeframe: str, 
     return df
 
 
+def fetch_htf_context(exchange: ccxt.Exchange, symbol: str) -> Dict[str, pd.DataFrame]:
+    """Fetch HTF FVG data independently from the scan timeframe selection."""
+
+    context = {}
+    for tf in HTF_FVG_TIMEFRAMES:
+        try:
+            context[tf] = fetch_ohlcv_dataframe(exchange, symbol, tf, MAX_HISTORY_BARS)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to fetch HTF data for %s %s: %s", symbol, tf, exc)
+    return context
+
+
 def compute_atr(df: pd.DataFrame, period: int) -> pd.Series:
     high = df["high"]
     low = df["low"]
@@ -307,6 +320,7 @@ def process_bias_system(df: pd.DataFrame) -> Tuple[List[bool], List[bool]]:
     _bias = None
     bullBias = False
     bearBias = False
+    prev_bias = None
     countBull = 0
     countBear = 0
     bull_signals = []
@@ -383,7 +397,7 @@ def process_bias_system(df: pd.DataFrame) -> Tuple[List[bool], List[bool]]:
         __isFvgUp = (i >= 2) and (lows[i] > highs[i - 2]) and (closes[i - 1] > highs[i - 2])
         __isFvgDown = (i >= 2) and (highs[i] < lows[i - 2]) and (closes[i - 1] < lows[i - 2])
 
-        if i > 0 and (_continueFlag != (_continueFlag if i == 0 else _continueFlag)):
+        if prev_bias is not None and prev_bias != _bias:
             countBull = 0
             countBear = 0
 
@@ -402,6 +416,8 @@ def process_bias_system(df: pd.DataFrame) -> Tuple[List[bool], List[bool]]:
             bullBias = False
         if bearBias and biasDownAlert:
             bearBias = False
+
+        prev_bias = _bias
 
     return bull_signals, bear_signals
 
@@ -550,8 +566,31 @@ def detect_ifvg(df: pd.DataFrame) -> Tuple[List[bool], List[bool]]:
 
 # =============================== SIGNAL ENGINE ===============================
 
-def process_symbol(symbol: str, timeframe: str, df: pd.DataFrame) -> List[Dict]:
+def process_htf_fvgs(htf_context: Dict[str, pd.DataFrame]):
+    """Process HTF FVG structures independently of the scan timeframes."""
+
+    settings = Settings()
+    structures = {cfg["htf"]: ImbalanceStructure(settings=ImbalanceSettings(**cfg)) for cfg in HTF_SETTINGS_DEFAULTS}
+    for tf, structure in structures.items():
+        if tf not in htf_context:
+            continue
+        df_htf = htf_context[tf]
+        series = []
+        for i in range(2, len(df_htf)):
+            row = (
+                (df_htf.loc[df_htf.index[i], "open"], df_htf.loc[df_htf.index[i], "high"], df_htf.loc[df_htf.index[i], "low"], df_htf.loc[df_htf.index[i], "close"], df_htf.loc[df_htf.index[i], "timestamp"]),
+                (df_htf.loc[df_htf.index[i - 1], "open"], df_htf.loc[df_htf.index[i - 1], "high"], df_htf.loc[df_htf.index[i - 1], "low"], df_htf.loc[df_htf.index[i - 1], "close"], df_htf.loc[df_htf.index[i - 1], "timestamp"]),
+                (df_htf.loc[df_htf.index[i - 2], "open"], df_htf.loc[df_htf.index[i - 2], "high"], df_htf.loc[df_htf.index[i - 2], "low"], df_htf.loc[df_htf.index[i - 2], "close"], df_htf.loc[df_htf.index[i - 2], "timestamp"]),
+            )
+            series.append(row)
+        structure.process(series, settings)
+    return structures
+
+
+def process_symbol(symbol: str, timeframe: str, df: pd.DataFrame, htf_context: Optional[Dict[str, pd.DataFrame]] = None) -> List[Dict]:
     signals = []
+    if htf_context is not None:
+        process_htf_fvgs(htf_context)
     bull_bias, bear_bias = process_bias_system(df)
 
     atr = compute_atr(df, 14)
@@ -607,16 +646,20 @@ def main():
     exchange = init_exchange()
     symbols = get_symbols(exchange)
     logging.info("Scanning %d symbols", len(symbols))
+    if not symbols:
+        logging.error("No symbols available for scanning. Check exchange markets or whitelist settings.")
+        return
 
     def run_once():
         for symbol in symbols:
+            htf_context = fetch_htf_context(exchange, symbol)
             for tf in SCAN_TIMEFRAMES:
                 try:
                     df = fetch_ohlcv_dataframe(exchange, symbol, tf, MAX_HISTORY_BARS)
                 except Exception as exc:  # noqa: BLE001
                     logging.warning("Fetch failed for %s %s: %s", symbol, tf, exc)
                     continue
-                signals = process_symbol(symbol, tf, df)
+                signals = process_symbol(symbol, tf, df, htf_context)
                 for sig in signals:
                     logging.info("%s, %s, %s, %.4f, %s", sig["symbol"], sig["timeframe"], sig["signal"], sig["price"], sig["time"])
 
