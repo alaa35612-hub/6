@@ -244,12 +244,18 @@ def compute_trend(series: List[float], lookback: int) -> int:
     return 0
 
 
-def score_confidence(long_score: int, short_score: int) -> float:
-    """تحويل الفارق بين الدرجات إلى نسبة مئوية مبسطة لقياس دقة/ثقة الإشارة."""
+def score_confidence(long_score: int, short_score: int, coverage: float) -> float:
+    """
+    تحويل الفارق بين الدرجات إلى نسبة مئوية مبسطة لقياس دقة/ثقة الإشارة
+    مع وزن إضافي بناءً على جودة البيانات المتاحة.
+    """
 
     total = max(long_score + short_score, 1)
     diff = abs(long_score - short_score)
-    return round(min(100.0, (diff / total) * 100), 1)
+    raw = min(100.0, (diff / total) * 100)
+    # تغطية البيانات (0-100) تقلل الثقة إذا كانت المدخلات ناقصة.
+    weighted = raw * max(0.25, coverage / 100)
+    return round(weighted, 1)
 
 
 def classify_momentum(price_chg: float, oi_chg: float) -> str:
@@ -343,7 +349,8 @@ def evaluate_signal(
     t = adjust_thresholds_dynamic(volatility, price_returns, oi_returns)
 
     # إشارات تأكيد/إلغاء بناءً على الأساس والتمويل ونسبة المتداولين الكبار
-    basis_pct = metrics.get("basis_pct") or 0.0
+    basis_raw = metrics.get("basis_pct")
+    basis_pct = basis_raw or 0.0
     funding = metrics.get("funding_rate")
     top_ratio = metrics.get("top_long_short_ratio")
     buy_sell_ratio = metrics.get("buy_sell_ratio")
@@ -358,6 +365,19 @@ def evaluate_signal(
     long_score = 0
     short_score = 0
     notes: List[str] = []
+
+    # تغطية البيانات: كلما زادت المقاييس المتاحة ارتفعت الثقة في القرار
+    coverage_checks = [
+        basis_raw is not None,
+        funding is not None,
+        top_ratio is not None,
+        buy_sell_ratio is not None,
+        oi_to_liquidity is not None,
+        price_trend != 0,
+        oi_trend != 0,
+        momentum not in {"زخم جانبي/ضعيف"},
+    ]
+    coverage_pct = (sum(coverage_checks) / len(coverage_checks)) * 100
 
     # ترجيح التمويل والأساس كعوامل تشبع/حذر
     if funding is not None:
@@ -490,7 +510,7 @@ def evaluate_signal(
             notes.append("فلاش هبوطي: تغطية شورت/انتظار قبل بيع جديد")
             long_score += 1
         joined = " | ".join(notes)
-        return "⚪️ NEUTRAL/WAIT", joined, long_score, short_score, score_confidence(long_score, short_score)
+        return "⚪️ NEUTRAL/WAIT", joined, long_score, short_score, score_confidence(long_score, short_score, coverage_pct)
 
     # ترجيح نهائي مع حماية من التشبع المفرط
     if long_score > short_score + 1:
@@ -499,7 +519,7 @@ def evaluate_signal(
             " | ".join(notes) or momentum,
             long_score,
             short_score,
-            score_confidence(long_score, short_score),
+            score_confidence(long_score, short_score, coverage_pct),
         )
     if short_score > long_score + 1:
         return (
@@ -507,7 +527,7 @@ def evaluate_signal(
             " | ".join(notes) or momentum,
             long_score,
             short_score,
-            score_confidence(long_score, short_score),
+            score_confidence(long_score, short_score, coverage_pct),
         )
     if long_score == short_score and long_score > 0:
         return (
@@ -515,10 +535,10 @@ def evaluate_signal(
             "إشارات متعارضة: " + (" | ".join(notes) or momentum),
             long_score,
             short_score,
-            score_confidence(long_score, short_score),
+            score_confidence(long_score, short_score, coverage_pct),
         )
 
-    return "NEUTRAL", "-", long_score, short_score, score_confidence(long_score, short_score)
+    return "NEUTRAL", "-", long_score, short_score, score_confidence(long_score, short_score, coverage_pct)
 
 
 # ==========================================
