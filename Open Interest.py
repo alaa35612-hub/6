@@ -118,6 +118,10 @@ def request_with_retry(method, *args, **kwargs):
     for attempt in range(1, attempts + 1):
         try:
             return method(*args, **kwargs)
+        except ccxt.NotSupported as exc:
+            # لا جدوى من إعادة المحاولة إذا كان المنفذ غير مدعوم أصلاً.
+            print(f"⚠️ المنصة لا تدعم الطلب: {exc}")
+            return None
         except Exception as exc:  # noqa: BLE001
             if attempt == attempts:
                 raise
@@ -197,6 +201,12 @@ def fetch_ohlcv_and_oi(symbol: str) -> Optional[Tuple[List[List[float]], List[Di
             CONFIG.timeframe,
             limit=CONFIG.lookback + 1,
         )
+        if not isinstance(ohlcv, list) or not all(isinstance(c, (list, tuple)) for c in ohlcv):
+            print(f"⚠️ صيغة OHLCV غير متوقعة لـ {symbol} - تم التجاوز")
+            return None
+        if not isinstance(oi_history, list) or not all(isinstance(item, dict) for item in oi_history):
+            print(f"⚠️ صيغة OI غير متوقعة لـ {symbol} - تم التجاوز")
+            return None
         ohlcv, oi_history = align_by_timestamp(ohlcv, oi_history)
         if len(ohlcv) <= CONFIG.dynamic.min_samples or len(oi_history) <= CONFIG.dynamic.min_samples:
             print(f"⚠️ بيانات غير كافية لـ {symbol} - تم التجاوز")
@@ -280,9 +290,9 @@ def fetch_risk_metrics(symbol: str) -> Optional[Dict]:
         depth_ratio = (bid_depth / ask_depth) if ask_depth else None
 
         # تدفقات التصفيات (إن وُجدت)
-        liquidations = []
+        liquidations: List[Dict] = []
         try:
-            if getattr(exchange, "fetch_liquidations", None):
+            if exchange.has.get("fetchLiquidations") and getattr(exchange, "fetch_liquidations", None):
                 liq_resp = request_with_retry(
                     exchange.fetch_liquidations,
                     symbol,
@@ -291,9 +301,9 @@ def fetch_risk_metrics(symbol: str) -> Optional[Dict]:
                     {"limit": CONFIG.dynamic.liquidation_lookback},
                 )
                 if isinstance(liq_resp, list):
-                    liquidations = liq_resp
+                    liquidations = [item for item in liq_resp if isinstance(item, dict)]
                 elif isinstance(liq_resp, dict) and isinstance(liq_resp.get("data"), list):
-                    liquidations = liq_resp["data"]
+                    liquidations = [item for item in liq_resp.get("data") if isinstance(item, dict)]
         except Exception:
             liquidations = []
 
