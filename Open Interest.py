@@ -177,6 +177,10 @@ def get_top_symbols(limit: int) -> List[str]:
         if not _cache_valid(cache_key):
             _TICKERS_CACHE[cache_key] = (time.time(), request_with_retry(exchange.fetch_tickers))
         tickers = _TICKERS_CACHE[cache_key][1]
+        if not isinstance(tickers, dict):
+            print("⚠️ صيغة tickers غير متوقعة - تم التجاوز")
+            return []
+
         sorted_tickers = sorted(
             tickers.items(),
             key=lambda item: item[1].get("quoteVolume", 0),
@@ -245,7 +249,7 @@ def fetch_risk_metrics(symbol: str) -> Optional[Dict]:
                 None,
                 CONFIG.dynamic.funding_history,
             )
-            if funding_history_resp:
+            if isinstance(funding_history_resp, list):
                 funding_history = [float(row.get("fundingRate") or 0) for row in funding_history_resp]
         except Exception:
             funding_rate = None
