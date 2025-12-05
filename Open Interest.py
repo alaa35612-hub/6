@@ -13,6 +13,8 @@ from typing import Dict, List, Optional, Tuple
 @dataclass
 class Thresholds:
     """القيم الأساسية قبل أي ضبط ديناميكي."""
+
+    # ستظل هذه القيم أساساً، لكن سيتم تعديلها لاحقاً إحصائياً بحسب تذبذب كل أصل.
     bearish_oi_increase: float = 3.0
     bearish_price_max_drop: float = -0.5
     bearish_price_limit_drop: float = -2.5
@@ -24,11 +26,22 @@ class Thresholds:
 
 
 @dataclass
+class DynamicTuning:
+    """عوامل تضخيم/تهدئة ديناميكية مشتقة من التوزيع التاريخي."""
+
+    price_sigma_mult: float = 1.25
+    oi_sigma_mult: float = 1.15
+    vol_sensitivity: float = 0.25
+    min_samples: int = 20
+
+
+@dataclass
 class Config:
     timeframe: str = "15m"
     limit_coins: int = 200
-    lookback: int = 3
+    lookback: int = 50
     thresholds: Thresholds = Thresholds()
+    dynamic: DynamicTuning = DynamicTuning()
     throttle_delay: float = 0.15
 
 
@@ -52,10 +65,20 @@ TERM_MAPPING: Dict[str, Tuple[str, str]] = {
 # 2. تهيئة الاتصال بالمنصة
 # ==========================================
 print("🔄 جاري الاتصال بمنصة Binance Futures...")
-exchange = ccxt.binanceusdm({
-    "enableRateLimit": True,
-    "options": {"defaultType": "future"},
-})
+exchange = ccxt.binanceusdm(
+    {
+        "enableRateLimit": True,
+        "options": {"defaultType": "future"},
+    }
+)
+
+# تحميل الأسواق مرة واحدة لتصفية عقود USDT-M فقط.
+exchange.load_markets()
+FUTURES_USDT = {
+    symbol
+    for symbol, meta in exchange.markets.items()
+    if meta.get("linear") and meta.get("quote") == "USDT" and meta.get("active", True)
+}
 
 # ==========================================
 # 3. الدوال المساعدة (Helper Functions)
@@ -63,7 +86,8 @@ exchange = ccxt.binanceusdm({
 
 
 def get_top_symbols(limit: int) -> List[str]:
-    """جلب أعلى العملات من حيث حجم التداول (Quote Volume)."""
+    """جلب أعلى عملات العقود الدائمة USDT-M من حيث حجم التداول."""
+
     try:
         tickers = exchange.fetch_tickers()
         sorted_tickers = sorted(
@@ -71,7 +95,8 @@ def get_top_symbols(limit: int) -> List[str]:
             key=lambda item: item[1].get("quoteVolume", 0),
             reverse=True,
         )
-        symbols = [symbol for symbol, data in sorted_tickers if symbol.endswith("/USDT")]
+
+        symbols = [symbol for symbol, data in sorted_tickers if symbol in FUTURES_USDT]
         return symbols[:limit]
     except Exception as exc:  # noqa: BLE001 - نعرض الخطأ للمستخدم
         print(f"⚠️ خطأ في جلب الرموز: {exc}")
@@ -80,29 +105,51 @@ def get_top_symbols(limit: int) -> List[str]:
 
 def fetch_ohlcv_and_oi(symbol: str) -> Optional[Tuple[List[List[float]], List[Dict]]]:
     """جلب OHLCV والـ OI التاريخي للرمز."""
+
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, CONFIG.timeframe, limit=CONFIG.lookback + 1)
         oi_history = exchange.fetch_open_interest_history(
-            symbol, CONFIG.timeframe, limit=CONFIG.lookback + 1
+            symbol,
+            CONFIG.timeframe,
+            limit=CONFIG.lookback + 1,
         )
-        if len(ohlcv) < 2 or len(oi_history) < 2:
+        if len(ohlcv) <= CONFIG.dynamic.min_samples or len(oi_history) <= CONFIG.dynamic.min_samples:
+            print(f"⚠️ بيانات غير كافية لـ {symbol} - تم التجاوز")
             return None
         return ohlcv, oi_history
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - نعرض الخطأ للمستخدم
+        print(f"⚠️ تعذر جلب البيانات لـ {symbol}: {exc}")
         return None
 
 
-def compute_changes(ohlcv: List[List[float]], oi_history: List[Dict]) -> Tuple[float, float, float]:
-    """يحسب التغيرات بالنسبة المئوية والتذبذب البسيط."""
-    close_prices = [candle[4] for candle in ohlcv[-CONFIG.lookback:]]
-    price_change_pct = ((close_prices[-1] - close_prices[-2]) / close_prices[-2]) * 100
+def compute_changes(
+    ohlcv: List[List[float]], oi_history: List[Dict]
+) -> Tuple[
+    float,
+    float,
+    float,
+    List[float],
+    List[float],
+]:
+    """يحسب التغيرات بالنسبة المئوية والتذبذب البسيط + سلاسل تاريخية."""
 
-    current_oi = float(oi_history[-1]["openInterestAmount"])
-    prev_oi = float(oi_history[-2]["openInterestAmount"])
-    oi_change_pct = ((current_oi - prev_oi) / prev_oi) * 100
+    closes = [candle[4] for candle in ohlcv[-CONFIG.lookback :]]
+    price_returns = [((closes[i] - closes[i - 1]) / closes[i - 1]) * 100 for i in range(1, len(closes))]
 
-    volatility = pstdev(close_prices) / close_prices[-1] * 100
-    return round(price_change_pct, 2), round(oi_change_pct, 2), round(volatility, 2)
+    oi_series = [float(point["openInterestAmount"]) for point in oi_history[-CONFIG.lookback :]]
+    oi_returns = [((oi_series[i] - oi_series[i - 1]) / oi_series[i - 1]) * 100 for i in range(1, len(oi_series))]
+
+    price_change_pct = price_returns[-1]
+    oi_change_pct = oi_returns[-1]
+    volatility = pstdev(closes) / closes[-1] * 100
+
+    return (
+        round(price_change_pct, 2),
+        round(oi_change_pct, 2),
+        round(volatility, 2),
+        price_returns,
+        oi_returns,
+    )
 
 
 # ==========================================
@@ -110,30 +157,46 @@ def compute_changes(ohlcv: List[List[float]], oi_history: List[Dict]) -> Tuple[f
 # ==========================================
 
 
-def adjust_thresholds_by_volatility(volatility: float) -> Thresholds:
-    """تعديل ديناميكي للعتبات بناءً على التذبذب الحالي."""
-    scale = 1.0
-    if volatility < CONFIG.thresholds.min_volatility:
-        scale = 0.7
-    elif volatility > CONFIG.thresholds.max_volatility:
-        scale = 1.3
+def adjust_thresholds_dynamic(
+    volatility: float, price_returns: List[float], oi_returns: List[float]
+) -> Thresholds:
+    """تعديل ديناميكي للعتبات بناءً على التذبذب وتوزيع التغيرات التاريخية."""
 
     base = CONFIG.thresholds
+    tuning = CONFIG.dynamic
+
+    price_mu = sum(price_returns) / len(price_returns)
+    oi_mu = sum(oi_returns) / len(oi_returns)
+
+    price_sigma = pstdev(price_returns)
+    oi_sigma = pstdev(oi_returns)
+
+    vol_scale = 1 + tuning.vol_sensitivity * max(0, (volatility - base.min_volatility))
+    price_band = tuning.price_sigma_mult * price_sigma
+    oi_band = tuning.oi_sigma_mult * oi_sigma
+
     return Thresholds(
-        bearish_oi_increase=base.bearish_oi_increase * scale,
-        bearish_price_max_drop=base.bearish_price_max_drop * scale,
-        bearish_price_limit_drop=base.bearish_price_limit_drop * scale,
-        bullish_price_drop=base.bullish_price_drop * scale,
-        bullish_oi_drop=base.bullish_oi_drop * scale,
-        exhaustion_oi_drop=base.exhaustion_oi_drop * scale,
+        bearish_oi_increase=max(base.bearish_oi_increase, oi_mu + oi_band) * vol_scale,
+        bearish_price_max_drop=min(base.bearish_price_max_drop, price_mu + price_band) * vol_scale,
+        bearish_price_limit_drop=min(base.bearish_price_limit_drop, price_mu - price_band) * vol_scale,
+        bullish_price_drop=min(base.bullish_price_drop, price_mu - price_band * 1.1) * vol_scale,
+        bullish_oi_drop=min(base.bullish_oi_drop, oi_mu - oi_band * 1.1) * vol_scale,
+        exhaustion_oi_drop=min(base.exhaustion_oi_drop, oi_mu - oi_band) * vol_scale,
         min_volatility=base.min_volatility,
         max_volatility=base.max_volatility,
     )
 
 
-def evaluate_signal(price_chg: float, oi_chg: float, volatility: float) -> Tuple[str, str]:
+def evaluate_signal(
+    price_chg: float,
+    oi_chg: float,
+    volatility: float,
+    price_returns: List[float],
+    oi_returns: List[float],
+) -> Tuple[str, str]:
     """تطبيق قواعد الاستراتيجية وإرجاع الإشارة مع المبرر."""
-    t = adjust_thresholds_by_volatility(volatility)
+
+    t = adjust_thresholds_dynamic(volatility, price_returns, oi_returns)
 
     # 1) المصيدة الهبوطية (Trapped Longs)
     if t.bearish_price_limit_drop < price_chg < t.bearish_price_max_drop and oi_chg > t.bearish_oi_increase:
@@ -169,6 +232,7 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
 
     longs: List[List[str]] = []
     shorts: List[List[str]] = []
+    scanned = 0
 
     for idx, symbol in enumerate(symbols, start=1):
         print(f"[{idx}/{CONFIG.limit_coins}] فحص {symbol}...", end="\r")
@@ -176,9 +240,10 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
         if not payload:
             continue
 
+        scanned += 1
         ohlcv, oi_history = payload
-        price_chg, oi_chg, volatility = compute_changes(ohlcv, oi_history)
-        signal, rationale = evaluate_signal(price_chg, oi_chg, volatility)
+        price_chg, oi_chg, volatility, price_returns, oi_returns = compute_changes(ohlcv, oi_history)
+        signal, rationale = evaluate_signal(price_chg, oi_chg, volatility, price_returns, oi_returns)
 
         if signal != "NEUTRAL":
             row = [
@@ -196,6 +261,7 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
 
         time.sleep(CONFIG.throttle_delay)
 
+    print(f"\n✅ تم فحص {scanned} أزواج بعينات كافية من أصل {len(symbols)}")
     return longs, shorts
 
 
