@@ -329,8 +329,8 @@ def evaluate_signal(
     price_returns: List[float],
     oi_returns: List[float],
     metrics: Dict,
-) -> Tuple[str, str]:
-    """تطبيق قواعد الاستراتيجية وإرجاع الإشارة مع المبرر."""
+) -> Tuple[str, str, int, int]:
+    """تطبيق قواعد الاستراتيجية وإرجاع الإشارة مع المبرر ونقاط الصعود/الهبوط."""
 
     t = adjust_thresholds_dynamic(volatility, price_returns, oi_returns)
 
@@ -466,17 +466,18 @@ def evaluate_signal(
         elif "Long Squeeze" in flash_event:
             notes.append("فلاش هبوطي: تغطية شورت/انتظار قبل بيع جديد")
             long_score += 1
-        return "⚪️ NEUTRAL/WAIT", " | ".join(notes)
+        joined = " | ".join(notes)
+        return "⚪️ NEUTRAL/WAIT", joined, long_score, short_score
 
     # ترجيح نهائي مع حماية من التشبع المفرط
     if long_score > short_score + 1:
-        return "🟢 LONG", " | ".join(notes) or momentum
+        return "🟢 LONG", " | ".join(notes) or momentum, long_score, short_score
     if short_score > long_score + 1:
-        return "🔴 SHORT", " | ".join(notes) or momentum
+        return "🔴 SHORT", " | ".join(notes) or momentum, long_score, short_score
     if long_score == short_score and long_score > 0:
-        return "⚪️ NEUTRAL/WAIT", "إشارات متعارضة: " + (" | ".join(notes) or momentum)
+        return "⚪️ NEUTRAL/WAIT", "إشارات متعارضة: " + (" | ".join(notes) or momentum), long_score, short_score
 
-    return "NEUTRAL", "-"
+    return "NEUTRAL", "-", long_score, short_score
 
 
 # ==========================================
@@ -504,7 +505,14 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
         metrics = fetch_risk_metrics(symbol) or {}
         metrics["ohlcv_closes"] = [candle[4] for candle in ohlcv[-CONFIG.lookback :]]
         metrics["oi_series"] = [float(point["openInterestAmount"]) for point in oi_history[-CONFIG.lookback :]]
-        signal, rationale = evaluate_signal(price_chg, oi_chg, volatility, price_returns, oi_returns, metrics)
+        signal, rationale, long_score, short_score = evaluate_signal(
+            price_chg,
+            oi_chg,
+            volatility,
+            price_returns,
+            oi_returns,
+            metrics,
+        )
         momentum = classify_momentum(price_chg, oi_chg)
         flash = detect_flash_event(price_chg, oi_chg, price_returns, oi_returns)
 
@@ -525,6 +533,8 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
                 f"{funding_rate:.4f}" if funding_rate is not None else "-",
                 f"{top_ratio:.2f}" if top_ratio is not None else "-",
                 f"{oi_to_liquidity:.2f}" if oi_to_liquidity is not None else "-",
+                str(long_score),
+                str(short_score),
                 momentum,
                 flash or "-",
                 signal,
@@ -561,6 +571,8 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
         "Funding",
         "Top L/S",
         "OI/Liq",
+        "LScore",
+        "SScore",
         "Momentum",
         "Flash",
         "Signal",
@@ -607,25 +619,33 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
     if longs or shorts:
         print("\n📌 قرار الدخول المقترح بعد التحليل:")
         for row in annotate(longs, "LONG"):
-            symbol, momentum, flash, signal, action, reason = (
+            symbol, lscore, sscore, momentum, flash, signal, action, reason = (
                 row[0],
                 row[9],
                 row[10],
                 row[11],
                 row[12],
                 row[13],
+                row[14],
+                row[15],
             )
-            print(f"✅ {symbol}: {action} | {signal} | {momentum} | {flash} | {reason}")
+            print(
+                f"✅ {symbol}: {action} | {signal} | L:{lscore} / S:{sscore} | {momentum} | {flash} | {reason}"
+            )
         for row in annotate(shorts, "SHORT"):
-            symbol, momentum, flash, signal, action, reason = (
+            symbol, lscore, sscore, momentum, flash, signal, action, reason = (
                 row[0],
                 row[9],
                 row[10],
                 row[11],
                 row[12],
                 row[13],
+                row[14],
+                row[15],
             )
-            print(f"⚠️ {symbol}: {action} | {signal} | {momentum} | {flash} | {reason}")
+            print(
+                f"⚠️ {symbol}: {action} | {signal} | L:{lscore} / S:{sscore} | {momentum} | {flash} | {reason}"
+            )
 
 
 # ==========================================
