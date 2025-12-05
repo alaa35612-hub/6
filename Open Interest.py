@@ -385,18 +385,29 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
         "Funding",
         "Top L/S",
         "Signal",
+        "Action",
         "Reason",
     ]
 
+    def annotate(rows: List[List[str]], bias: str) -> List[List[str]]:
+        """إضافة توصية دخول واضحة لكل صف لتسهيل القراءة بعد التحليل."""
+
+        action = "ادخل شراء" if bias == "LONG" else "ادخل بيع"
+        enriched: List[List[str]] = []
+        for row in rows:
+            # row schema before: [symbol, price%, oi%, vol%, fut, basis, funding, top, signal, reason]
+            enriched.append(row[:-1] + [action, row[-1]])
+        return enriched
+
     if longs:
         print("\n🟢 فرص شراء محتملة (Long Candidates):")
-        print(tabulate(longs, headers=headers, tablefmt="grid"))
+        print(tabulate(annotate(longs, "LONG"), headers=headers, tablefmt="grid"))
     else:
         print("\n🟢 لا توجد فرص Long مطابقة حالياً.")
 
     if shorts:
         print("\n🔴 فرص بيع محتملة (Short Candidates):")
-        print(tabulate(shorts, headers=headers, tablefmt="grid"))
+        print(tabulate(annotate(shorts, "SHORT"), headers=headers, tablefmt="grid"))
     else:
         print("\n🔴 لا توجد فرص Short مطابقة حالياً.")
 
@@ -406,6 +417,13 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
     print("- السعر يرتفع + OI ينخفض = ضعف في الاتجاه الصاعد")
     print("- Basis موجب + تمويل مرتفع + OI مرتفع = ضغط بيع محتمل")
     print("- Basis سالب + تمويل سلبي + تفريغ OI = احتمالية ارتداد صعودي")
+
+    if longs or shorts:
+        print("\n📌 قرار الدخول المقترح بعد التحليل:")
+        for row in annotate(longs, "LONG"):
+            print(f"✅ {row[0]}: {row[9]} | {row[10]}")
+        for row in annotate(shorts, "SHORT"):
+            print(f"⚠️ {row[0]}: {row[9]} | {row[10]}")
 
 
 # ==========================================
