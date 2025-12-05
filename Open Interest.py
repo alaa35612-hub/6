@@ -244,6 +244,14 @@ def compute_trend(series: List[float], lookback: int) -> int:
     return 0
 
 
+def score_confidence(long_score: int, short_score: int) -> float:
+    """تحويل الفارق بين الدرجات إلى نسبة مئوية مبسطة لقياس دقة/ثقة الإشارة."""
+
+    total = max(long_score + short_score, 1)
+    diff = abs(long_score - short_score)
+    return round(min(100.0, (diff / total) * 100), 1)
+
+
 def classify_momentum(price_chg: float, oi_chg: float) -> str:
     """تصنيف الزخم اللحظي وفق حالات السعر/الفائدة المفتوحة."""
 
@@ -329,8 +337,8 @@ def evaluate_signal(
     price_returns: List[float],
     oi_returns: List[float],
     metrics: Dict,
-) -> Tuple[str, str, int, int]:
-    """تطبيق قواعد الاستراتيجية وإرجاع الإشارة مع المبرر ونقاط الصعود/الهبوط."""
+) -> Tuple[str, str, int, int, float]:
+    """تطبيق قواعد الاستراتيجية وإرجاع الإشارة مع المبرر ونقاط الصعود/الهبوط ونسبة ثقة مبسطة."""
 
     t = adjust_thresholds_dynamic(volatility, price_returns, oi_returns)
 
@@ -398,6 +406,21 @@ def evaluate_signal(
     if "Long Squeeze" in momentum:
         short_score += 1
         notes.append("سوق يهبط بتفريغ لونغات")
+
+    # ترند عام للسعر ولـ OI يضيف أولوية إضافية لاتجاه الترند السائد
+    if price_trend == 1:
+        long_score += 1
+        notes.append("ترند سعري عام صاعد يدعم اللونغ")
+    elif price_trend == -1:
+        short_score += 1
+        notes.append("ترند سعري عام هابط يدعم الشورت")
+
+    if oi_trend == 1:
+        long_score += 1
+        notes.append("ترند OI صاعد = دخول سيولة جديدة")
+    elif oi_trend == -1:
+        short_score += 1
+        notes.append("ترند OI هابط = تفريغ مراكز")
 
     if buy_sell_ratio:
         if buy_sell_ratio >= 1.2:
@@ -467,17 +490,35 @@ def evaluate_signal(
             notes.append("فلاش هبوطي: تغطية شورت/انتظار قبل بيع جديد")
             long_score += 1
         joined = " | ".join(notes)
-        return "⚪️ NEUTRAL/WAIT", joined, long_score, short_score
+        return "⚪️ NEUTRAL/WAIT", joined, long_score, short_score, score_confidence(long_score, short_score)
 
     # ترجيح نهائي مع حماية من التشبع المفرط
     if long_score > short_score + 1:
-        return "🟢 LONG", " | ".join(notes) or momentum, long_score, short_score
+        return (
+            "🟢 LONG",
+            " | ".join(notes) or momentum,
+            long_score,
+            short_score,
+            score_confidence(long_score, short_score),
+        )
     if short_score > long_score + 1:
-        return "🔴 SHORT", " | ".join(notes) or momentum, long_score, short_score
+        return (
+            "🔴 SHORT",
+            " | ".join(notes) or momentum,
+            long_score,
+            short_score,
+            score_confidence(long_score, short_score),
+        )
     if long_score == short_score and long_score > 0:
-        return "⚪️ NEUTRAL/WAIT", "إشارات متعارضة: " + (" | ".join(notes) or momentum), long_score, short_score
+        return (
+            "⚪️ NEUTRAL/WAIT",
+            "إشارات متعارضة: " + (" | ".join(notes) or momentum),
+            long_score,
+            short_score,
+            score_confidence(long_score, short_score),
+        )
 
-    return "NEUTRAL", "-", long_score, short_score
+    return "NEUTRAL", "-", long_score, short_score, score_confidence(long_score, short_score)
 
 
 # ==========================================
@@ -505,7 +546,7 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
         metrics = fetch_risk_metrics(symbol) or {}
         metrics["ohlcv_closes"] = [candle[4] for candle in ohlcv[-CONFIG.lookback :]]
         metrics["oi_series"] = [float(point["openInterestAmount"]) for point in oi_history[-CONFIG.lookback :]]
-        signal, rationale, long_score, short_score = evaluate_signal(
+        signal, rationale, long_score, short_score, confidence = evaluate_signal(
             price_chg,
             oi_chg,
             volatility,
@@ -535,6 +576,7 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
                 f"{oi_to_liquidity:.2f}" if oi_to_liquidity is not None else "-",
                 str(long_score),
                 str(short_score),
+                f"{confidence}%",
                 momentum,
                 flash or "-",
                 signal,
@@ -546,6 +588,10 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
                 shorts.append(row)
 
         time.sleep(CONFIG.throttle_delay)
+
+    # ترتيب المخرجات تنازلياً حسب قوة/ثقة الإشارة
+    longs.sort(key=lambda r: float(r[11].replace("%", "")), reverse=True)
+    shorts.sort(key=lambda r: float(r[11].replace("%", "")), reverse=True)
 
     print(f"\n✅ تم فحص {scanned} أزواج بعينات كافية من أصل {len(symbols)}")
     return longs, shorts
@@ -573,6 +619,7 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
         "OI/Liq",
         "LScore",
         "SScore",
+        "Conf %",
         "Momentum",
         "Flash",
         "Signal",
@@ -586,7 +633,7 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
         action = "ادخل شراء" if bias == "LONG" else "ادخل بيع"
         enriched: List[List[str]] = []
         for row in rows:
-            # row schema before: [symbol, price%, oi%, vol%, fut, basis, funding, top, oi/liquidity, momentum, flash, signal, reason]
+            # row schema before: [symbol, price%, oi%, vol%, fut, basis, funding, top, oi/liquidity, L, S, Conf, momentum, flash, signal, reason]
             enriched.append(row[:-1] + [action, row[-1]])
         return enriched
 
@@ -619,7 +666,7 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
     if longs or shorts:
         print("\n📌 قرار الدخول المقترح بعد التحليل:")
         for row in annotate(longs, "LONG"):
-            symbol, lscore, sscore, momentum, flash, signal, action, reason = (
+            symbol, lscore, sscore, conf, momentum, flash, signal, action, reason = (
                 row[0],
                 row[9],
                 row[10],
@@ -628,12 +675,13 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
                 row[13],
                 row[14],
                 row[15],
+                row[16],
             )
             print(
-                f"✅ {symbol}: {action} | {signal} | L:{lscore} / S:{sscore} | {momentum} | {flash} | {reason}"
+                f"✅ {symbol}: {action} | {signal} | ثقة {conf} | L:{lscore} / S:{sscore} | {momentum} | {flash} | {reason}"
             )
         for row in annotate(shorts, "SHORT"):
-            symbol, lscore, sscore, momentum, flash, signal, action, reason = (
+            symbol, lscore, sscore, conf, momentum, flash, signal, action, reason = (
                 row[0],
                 row[9],
                 row[10],
@@ -642,9 +690,10 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
                 row[13],
                 row[14],
                 row[15],
+                row[16],
             )
             print(
-                f"⚠️ {symbol}: {action} | {signal} | L:{lscore} / S:{sscore} | {momentum} | {flash} | {reason}"
+                f"⚠️ {symbol}: {action} | {signal} | ثقة {conf} | L:{lscore} / S:{sscore} | {momentum} | {flash} | {reason}"
             )
 
 
