@@ -23,6 +23,14 @@ class Thresholds:
     exhaustion_oi_drop: float = -1.5
     min_volatility: float = 0.4
     max_volatility: float = 2.5
+    funding_high: float = 0.01
+    funding_extreme_high: float = 0.07
+    funding_extreme_low: float = -0.05
+    basis_extreme_pos: float = 1.5
+    basis_extreme_neg: float = -1.5
+    oi_liquidity_hot: float = 5.0
+    top_ratio_high: float = 1.5
+    top_ratio_low: float = 0.8
 
 
 @dataclass
@@ -33,6 +41,8 @@ class DynamicTuning:
     oi_sigma_mult: float = 1.15
     vol_sensitivity: float = 0.25
     min_samples: int = 20
+    flash_sigma_mult: float = 3.0
+    momentum_floor: float = 0.05
 
 
 @dataclass
@@ -216,6 +226,49 @@ def compute_changes(
     )
 
 
+def classify_momentum(price_chg: float, oi_chg: float) -> str:
+    """تصنيف الزخم اللحظي وفق حالات السعر/الفائدة المفتوحة."""
+
+    floor = CONFIG.dynamic.momentum_floor
+    price_up = price_chg > floor
+    price_down = price_chg < -floor
+    oi_up = oi_chg > floor
+    oi_down = oi_chg < -floor
+
+    if price_up and oi_up:
+        return "زخم صعودي حقيقي (Price↑ + OI↑)"
+    if price_up and oi_down:
+        return "Short Squeeze محتمل (Price↑ + OI↓)"
+    if price_down and oi_up:
+        return "زخم هبوطي حقيقي (Price↓ + OI↑)"
+    if price_down and oi_down:
+        return "Long Squeeze محتمل (Price↓ + OI↓)"
+    return "زخم جانبي/ضعيف"
+
+
+def detect_flash_event(
+    price_chg: float,
+    oi_chg: float,
+    price_returns: List[float],
+    oi_returns: List[float],
+) -> Optional[str]:
+    """رصد أحداث الفلاش عبر انحرافات سعرية/‏OI حادة عن التوزيع التاريخي."""
+
+    if len(price_returns) < 5 or len(oi_returns) < 5:
+        return None
+
+    price_sigma = pstdev(price_returns)
+    oi_sigma = pstdev(oi_returns)
+    p_thr = CONFIG.dynamic.flash_sigma_mult * price_sigma
+    oi_thr = CONFIG.dynamic.flash_sigma_mult * oi_sigma
+
+    if price_chg > p_thr and oi_chg < -oi_thr:
+        return "Flash Short Squeeze (قفزة + تفريغ OI)"
+    if price_chg < -p_thr and oi_chg < -oi_thr:
+        return "Flash Long Squeeze (انهيار + تفريغ OI)"
+    return None
+
+
 # ==========================================
 # 4. المنطق الاستراتيجي
 # ==========================================
@@ -268,45 +321,102 @@ def evaluate_signal(
     funding = metrics.get("funding_rate")
     top_ratio = metrics.get("top_long_short_ratio")
     buy_sell_ratio = metrics.get("buy_sell_ratio")
+    oi_to_liquidity = metrics.get("oi_to_liquidity")
 
-    # 1) المصيدة الهبوطية (Trapped Longs)
+    momentum = classify_momentum(price_chg, oi_chg)
+    flash_event = detect_flash_event(price_chg, oi_chg, price_returns, oi_returns)
+
+    long_score = 0
+    short_score = 0
+    notes: List[str] = []
+
+    # ترجيح التمويل والأساس كعوامل تشبع/حذر
+    if funding is not None:
+        if funding >= t.funding_extreme_high:
+            notes.append("تمويل موجب متطرف = تشبع شرائي")
+            short_score += 2
+        elif funding >= t.funding_high:
+            notes.append("تمويل موجب مرتفع")
+            short_score += 1
+        elif funding <= t.funding_extreme_low:
+            notes.append("تمويل سلبي متطرف = تشبع بيعي")
+            long_score += 2
+    if basis_pct >= t.basis_extreme_pos:
+        notes.append("أساس موجب مرتفع (كونتانجو مبالغ)")
+        short_score += 1
+    if basis_pct <= t.basis_extreme_neg:
+        notes.append("أساس سالب كبير (باكوارد)")
+        long_score += 1
+    if oi_to_liquidity and oi_to_liquidity >= t.oi_liquidity_hot:
+        notes.append("رافعة مرتفعة: OI/السيولة في خطر")
+        short_score += 1
+
+    # الزخم اللحظي
+    if "صعودي" in momentum and "حقيقي" in momentum:
+        long_score += 2
+    if "هبوطي" in momentum and "حقيقي" in momentum:
+        short_score += 2
+    if "Short Squeeze" in momentum:
+        long_score += 1
+        notes.append("سوق يصعد بتفريغ شورتات")
+    if "Long Squeeze" in momentum:
+        short_score += 1
+        notes.append("سوق يهبط بتفريغ لونغات")
+
+    if buy_sell_ratio:
+        if buy_sell_ratio >= 1.2:
+            notes.append("تفضيل شراء من التيكرز")
+            long_score += 1
+        elif buy_sell_ratio <= 0.8:
+            notes.append("تفضيل بيع من التيكرز")
+            short_score += 1
+
+    # إشارات أساسية موسعة
     if t.bearish_price_limit_drop < price_chg < t.bearish_price_max_drop and oi_chg > t.bearish_oi_increase:
-        rationale = "Sucker Pattern: Price flat/down + OI spiking"
-        if basis_pct > 0.5:
-            rationale += " | Basis مرتفع يدعم الهبوط"
-        if funding and funding > 0.01:
-            rationale += " | تمويل موجب مرتفع"
-        return "🔴 SHORT", rationale
+        short_score += 2
+        notes.append("مصيدة لونغ: سعر مسطح/OI يقفز")
 
-    # 2) الانعكاس الصعودي (Capitulation)
     if price_chg < t.bullish_price_drop and oi_chg < t.bullish_oi_drop:
-        rationale = "Capitulation: Price & OI collapse"
-        if funding and funding < 0:
-            rationale += " | تمويل سلبي يشجع الارتداد"
-        return "🟢 LONG", rationale
+        long_score += 2
+        notes.append("استسلام/Capitulation: سعر وOI ينهاران")
 
-    # 3) إنهاك الاتجاه الصاعد
     if price_chg > 0 and oi_chg < t.exhaustion_oi_drop:
-        rationale = "Trend Exhaustion: Price up with falling OI"
-        if basis_pct < -0.5:
-            rationale += " | Basis سلبي يقلل مخاطر الشراء"
-        return "⚪️ EXIT/CAUTIOUS LONG", rationale
+        notes.append("إنهاك صعودي: سعر ↑ مقابل OI ↓")
+        short_score += 1
 
-    # 4) تأكيد المقاومة بالعالقين (Breakdown بدون خروج)
     if price_chg < t.bearish_price_limit_drop and oi_chg > 0:
-        rationale = "Trapped Resistance: Breakdown without OI flush"
-        if top_ratio and top_ratio < 0.95:
-            rationale += " | كبار المتداولين يميلون للبيع"
-        return "🔴 SHORT", rationale
+        notes.append("كسر دعم بدون تفريغ OI -> مقاومة محتملة")
+        short_score += 1
 
-    # 5) ضغط شراء (Short squeeze محتمل)
     if price_chg > 1.0 and -1.5 <= oi_chg <= 0:
-        rationale = "Short squeeze fuel: Price rising while OI unwinds"
-        if funding and funding < 0:
-            rationale += " | تمويل سلبي يدعم squeeze"
-        if buy_sell_ratio and buy_sell_ratio > 1.2:
-            rationale += " | تفضيل شراء واضح"
-        return "🟢 LONG", rationale
+        notes.append("وقود Short Squeeze: سعر يرتفع مع تفريغ OI")
+        long_score += 1
+
+    # تأثير نسبة كبار المتداولين
+    if top_ratio is not None:
+        if top_ratio >= t.top_ratio_high:
+            notes.append("حيتان منحازة لونغ بشكل مرتفع")
+            long_score += 1
+        elif top_ratio <= t.top_ratio_low:
+            notes.append("حيتان منحازة شورت بقوة")
+            short_score += 1
+
+    # أحداث الفلاش تعطل الدخول اللحظي وتوجه للخروج/جني أرباح
+    if flash_event:
+        if "Short Squeeze" in flash_event:
+            notes.append("فلاش صعودي: فكر في جني أرباح اللونغ/تحوط")
+            short_score += 1
+        elif "Long Squeeze" in flash_event:
+            notes.append("فلاش هبوطي: فكر في تغطية الشورت/شراء عكسي")
+            long_score += 1
+
+    # ترجيح نهائي مع حماية من التشبع المفرط
+    if long_score > short_score + 1:
+        return "🟢 LONG", " | ".join(notes) or momentum
+    if short_score > long_score + 1:
+        return "🔴 SHORT", " | ".join(notes) or momentum
+    if long_score == short_score and long_score > 0:
+        return "⚪️ NEUTRAL/WAIT", "إشارات متعارضة: " + (" | ".join(notes) or momentum)
 
     return "NEUTRAL", "-"
 
@@ -335,11 +445,14 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
         price_chg, oi_chg, volatility, price_returns, oi_returns = compute_changes(ohlcv, oi_history)
         metrics = fetch_risk_metrics(symbol) or {}
         signal, rationale = evaluate_signal(price_chg, oi_chg, volatility, price_returns, oi_returns, metrics)
+        momentum = classify_momentum(price_chg, oi_chg)
+        flash = detect_flash_event(price_chg, oi_chg, price_returns, oi_returns)
 
         futures_price = metrics.get("futures_price")
         basis_pct = metrics.get("basis_pct")
         funding_rate = metrics.get("funding_rate")
         top_ratio = metrics.get("top_long_short_ratio")
+        oi_to_liquidity = metrics.get("oi_to_liquidity")
 
         if signal != "NEUTRAL":
             row = [
@@ -351,6 +464,9 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
                 f"{basis_pct:.2f}%" if basis_pct is not None else "-",
                 f"{funding_rate:.4f}" if funding_rate is not None else "-",
                 f"{top_ratio:.2f}" if top_ratio is not None else "-",
+                f"{oi_to_liquidity:.2f}" if oi_to_liquidity is not None else "-",
+                momentum,
+                flash or "-",
                 signal,
                 rationale,
             ]
@@ -384,6 +500,9 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
         "Basis %",
         "Funding",
         "Top L/S",
+        "OI/Liq",
+        "Momentum",
+        "Flash",
         "Signal",
         "Action",
         "Reason",
@@ -395,7 +514,7 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
         action = "ادخل شراء" if bias == "LONG" else "ادخل بيع"
         enriched: List[List[str]] = []
         for row in rows:
-            # row schema before: [symbol, price%, oi%, vol%, fut, basis, funding, top, signal, reason]
+            # row schema before: [symbol, price%, oi%, vol%, fut, basis, funding, top, oi/liquidity, momentum, flash, signal, reason]
             enriched.append(row[:-1] + [action, row[-1]])
         return enriched
 
