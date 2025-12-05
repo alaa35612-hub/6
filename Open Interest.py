@@ -31,6 +31,8 @@ class Thresholds:
     oi_liquidity_hot: float = 5.0
     top_ratio_high: float = 1.5
     top_ratio_low: float = 0.8
+    top_ratio_extreme_high: float = 2.5
+    top_ratio_extreme_low: float = 0.5
 
 
 @dataclass
@@ -43,6 +45,7 @@ class DynamicTuning:
     min_samples: int = 20
     flash_sigma_mult: float = 3.0
     momentum_floor: float = 0.05
+    price_trend_lookback: int = 10
 
 
 @dataclass
@@ -226,6 +229,21 @@ def compute_changes(
     )
 
 
+def compute_trend(series: List[float], lookback: int) -> int:
+    """ترند بسيط: مقارنة المتوسط القصير بالمتوسط الطويل لتقدير الاتجاه العام."""
+
+    if len(series) < lookback + 5:
+        return 0
+
+    short_avg = sum(series[-lookback:]) / lookback
+    long_avg = sum(series) / len(series)
+    if short_avg > long_avg * 1.002:
+        return 1
+    if short_avg < long_avg * 0.998:
+        return -1
+    return 0
+
+
 def classify_momentum(price_chg: float, oi_chg: float) -> str:
     """تصنيف الزخم اللحظي وفق حالات السعر/الفائدة المفتوحة."""
 
@@ -325,6 +343,8 @@ def evaluate_signal(
 
     momentum = classify_momentum(price_chg, oi_chg)
     flash_event = detect_flash_event(price_chg, oi_chg, price_returns, oi_returns)
+    price_trend = compute_trend([candle[4] for candle in metrics.get("ohlcv_closes", [])] or [0], CONFIG.dynamic.price_trend_lookback)
+    oi_trend = compute_trend(metrics.get("oi_series", []), CONFIG.dynamic.price_trend_lookback)
 
     long_score = 0
     short_score = 0
@@ -351,6 +371,21 @@ def evaluate_signal(
         notes.append("رافعة مرتفعة: OI/السيولة في خطر")
         short_score += 1
 
+    # تأثير نسبة كبار المتداولين مع القراءة المعاكسة عند التطرف
+    if top_ratio is not None:
+        if top_ratio >= t.top_ratio_extreme_high:
+            notes.append("حيتان لونغ بشكل مفرط (إشارة معاكسة محتملة)")
+            short_score += 2
+        elif top_ratio >= t.top_ratio_high:
+            notes.append("حيتان منحازة لونغ")
+            long_score += 1
+        elif top_ratio <= t.top_ratio_extreme_low:
+            notes.append("حيتان شورت بشكل مفرط (إشارة معاكسة صعودية)")
+            long_score += 2
+        elif top_ratio <= t.top_ratio_low:
+            notes.append("حيتان منحازة شورت")
+            short_score += 1
+
     # الزخم اللحظي
     if "صعودي" in momentum and "حقيقي" in momentum:
         long_score += 2
@@ -371,7 +406,7 @@ def evaluate_signal(
             notes.append("تفضيل بيع من التيكرز")
             short_score += 1
 
-    # إشارات أساسية موسعة
+    # إشارات أساسية موسعة + القواعد النصية
     if t.bearish_price_limit_drop < price_chg < t.bearish_price_max_drop and oi_chg > t.bearish_oi_increase:
         short_score += 2
         notes.append("مصيدة لونغ: سعر مسطح/OI يقفز")
@@ -392,23 +427,45 @@ def evaluate_signal(
         notes.append("وقود Short Squeeze: سعر يرتفع مع تفريغ OI")
         long_score += 1
 
-    # تأثير نسبة كبار المتداولين
-    if top_ratio is not None:
-        if top_ratio >= t.top_ratio_high:
-            notes.append("حيتان منحازة لونغ بشكل مرتفع")
-            long_score += 1
-        elif top_ratio <= t.top_ratio_low:
-            notes.append("حيتان منحازة شورت بقوة")
-            short_score += 1
+    # Long Rule 1: ترند صاعد + OI↑ + تمويل ≤0 + حيتان شورت + أساس ≤0
+    if price_trend == 1 and oi_trend == 1 and (funding or 0) <= 0 and (top_ratio is None or top_ratio < t.top_ratio_low) and basis_pct <= 0:
+        notes.append("لونغ 1: زخم صعودي مع تشبع بيعي (تمويل ≤0 وحيتان شورت)")
+        long_score += 3
+
+    # Long Rule 2: اختراق مدعوم بـ OI↑ وتمويل غير متطرف وأساس طبيعي
+    if price_chg > abs(t.bearish_price_max_drop) and oi_chg > max(0, t.bearish_oi_increase / 2) and (funding is None or funding < t.funding_high) and abs(basis_pct) < abs(t.basis_extreme_pos):
+        notes.append("لونغ 2: اختراق مدعوم بتدفق OI وتمويل غير متطرف")
+        long_score += 2
+
+    # Long Rule 3: Short Trap (نزول بطيء + OI↑ + تمويل سلبي + حيتان تتحول لونغ)
+    if price_chg < 0 and oi_chg > t.bearish_oi_increase and (funding or 0) < 0 and (top_ratio is None or top_ratio >= 1.0):
+        notes.append("لونغ 3: تراكم شورتات مع تمويل سالب -> احتمال Short Squeeze")
+        long_score += 2
+
+    # Short Rule 1: تشبع شرائي واضح (ترند صاعد + تمويل/أساس مرتفع + OI/Liq حار + حيتان لونغ)
+    if price_trend == 1 and (funding or 0) >= t.funding_extreme_high and basis_pct >= t.basis_extreme_pos and (oi_to_liquidity or 0) >= t.oi_liquidity_hot and (top_ratio or 0) >= t.top_ratio_high:
+        notes.append("شورت 1: تشبع شرائي (تمويل/أساس/رافعة مرتفعة والحيتان لونغ)")
+        short_score += 3
+
+    # Short Rule 2: اختراق كاذب/Short Squeeze (سعر↑ قوي + OI↓ + تمويل يقفز)
+    if price_chg > abs(t.bearish_price_max_drop) and oi_chg < t.exhaustion_oi_drop and (funding or 0) >= t.funding_high:
+        notes.append("شورت 2: اختراق كاذب/Short Squeeze غير مستدام")
+        short_score += 2
+
+    # Short Rule 3: Long Trap (صعود بطيء + OI↑ قوي + تمويل يرتفع + حيتان تخفف شراء)
+    if price_chg > 0 and oi_chg > t.bearish_oi_increase and (funding or 0) > 0 and (top_ratio is not None and top_ratio < t.top_ratio_high):
+        notes.append("شورت 3: تراكم لونغات برافعة مع خروج الحيتان")
+        short_score += 2
 
     # أحداث الفلاش تعطل الدخول اللحظي وتوجه للخروج/جني أرباح
     if flash_event:
         if "Short Squeeze" in flash_event:
-            notes.append("فلاش صعودي: فكر في جني أرباح اللونغ/تحوط")
+            notes.append("فلاش صعودي: جني أرباح/انتظار قبل أي لونغ جديد")
             short_score += 1
         elif "Long Squeeze" in flash_event:
-            notes.append("فلاش هبوطي: فكر في تغطية الشورت/شراء عكسي")
+            notes.append("فلاش هبوطي: تغطية شورت/انتظار قبل بيع جديد")
             long_score += 1
+        return "⚪️ NEUTRAL/WAIT", " | ".join(notes)
 
     # ترجيح نهائي مع حماية من التشبع المفرط
     if long_score > short_score + 1:
@@ -444,6 +501,8 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
         ohlcv, oi_history = payload
         price_chg, oi_chg, volatility, price_returns, oi_returns = compute_changes(ohlcv, oi_history)
         metrics = fetch_risk_metrics(symbol) or {}
+        metrics["ohlcv_closes"] = [candle[4] for candle in ohlcv[-CONFIG.lookback :]]
+        metrics["oi_series"] = [float(point["openInterestAmount"]) for point in oi_history[-CONFIG.lookback :]]
         signal, rationale = evaluate_signal(price_chg, oi_chg, volatility, price_returns, oi_returns, metrics)
         momentum = classify_momentum(price_chg, oi_chg)
         flash = detect_flash_event(price_chg, oi_chg, price_returns, oi_returns)
