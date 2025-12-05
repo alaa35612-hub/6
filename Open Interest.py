@@ -343,7 +343,8 @@ def evaluate_signal(
 
     momentum = classify_momentum(price_chg, oi_chg)
     flash_event = detect_flash_event(price_chg, oi_chg, price_returns, oi_returns)
-    price_trend = compute_trend([candle[4] for candle in metrics.get("ohlcv_closes", [])] or [0], CONFIG.dynamic.price_trend_lookback)
+    # سلسلة الإغلاقات جاهزة بالفعل في metrics["ohlcv_closes"], لذا نمررها مباشرة لتفادي فهرسة غير صحيحة
+    price_trend = compute_trend(metrics.get("ohlcv_closes", []) or [0], CONFIG.dynamic.price_trend_lookback)
     oi_trend = compute_trend(metrics.get("oi_series", []), CONFIG.dynamic.price_trend_lookback)
 
     long_score = 0
