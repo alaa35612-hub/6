@@ -46,6 +46,10 @@ class DynamicTuning:
     flash_sigma_mult: float = 3.0
     momentum_floor: float = 0.05
     price_trend_lookback: int = 10
+    outlier_sigma: float = 4.0
+    multi_timeframes: Tuple[str, ...] = ("5m", "1h", "4h")
+    funding_history: int = 50
+    liquidation_lookback: int = 50
 
 
 @dataclass
@@ -57,6 +61,10 @@ class Config:
     dynamic: DynamicTuning = DynamicTuning()
     throttle_delay: float = 0.15
     long_short_period: str = "5m"
+    orderbook_limit: int = 50
+    retry_attempts: int = 3
+    retry_backoff: float = 0.75
+    cache_ttl: float = 30.0
 
 
 CONFIG = Config()
@@ -94,16 +102,77 @@ FUTURES_USDT = {
     if meta.get("linear") and meta.get("quote") == "USDT" and meta.get("active", True)
 }
 
+# مخزن مؤقت للنتائج الباهظة زمنياً
+_TICKERS_CACHE: Dict[str, Tuple[float, Dict]] = {}
+
 # ==========================================
 # 3. الدوال المساعدة (Helper Functions)
 # ==========================================
 
 
+def request_with_retry(method, *args, **kwargs):
+    """تنفيذ طلب مع آلية إعادة المحاولة والتدرج البسيط."""
+
+    attempts = CONFIG.retry_attempts
+    delay = CONFIG.retry_backoff
+    for attempt in range(1, attempts + 1):
+        try:
+            return method(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            if attempt == attempts:
+                raise
+            sleep_for = delay * attempt
+            print(f"↻ إعادة المحاولة ({attempt}/{attempts}) بعد خطأ: {exc} -> الانتظار {sleep_for:.1f}s")
+            time.sleep(sleep_for)
+
+
+def _cache_valid(cache_key: str) -> bool:
+    ts = _TICKERS_CACHE.get(cache_key, (0,))[0]
+    return (time.time() - ts) < CONFIG.cache_ttl
+
+
+def filter_outliers(series: List[float], sigma: float) -> List[float]:
+    """إزالة القيم المتطرفة لتقليل الضوضاء في الأسواق منخفضة السيولة."""
+
+    if not series:
+        return series
+    mean_val = sum(series) / len(series)
+    std_val = pstdev(series) if len(series) > 1 else 0
+    if std_val == 0:
+        return series
+    filtered = [x for x in series if abs(x - mean_val) <= sigma * std_val]
+    return filtered if len(filtered) >= max(3, len(series) // 2) else series
+
+
+def align_by_timestamp(ohlcv: List[List[float]], oi_history: List[Dict]) -> Tuple[List[List[float]], List[Dict]]:
+    """مواءمة بيانات السعر وOI زمنياً لتقليل الانحراف."""
+
+    if not ohlcv or not oi_history:
+        return ohlcv, oi_history
+
+    timeframe_ms = exchange.parse_timeframe(CONFIG.timeframe) * 1000
+    oi_map = {int(item.get("timestamp") // timeframe_ms): item for item in oi_history}
+    aligned_ohlcv: List[List[float]] = []
+    aligned_oi: List[Dict] = []
+    for candle in ohlcv:
+        bucket = int(candle[0] // timeframe_ms)
+        if bucket in oi_map:
+            aligned_ohlcv.append(candle)
+            aligned_oi.append(oi_map[bucket])
+    # إذا قلَّت العينات نرجع الأصل بدون تعديل
+    if len(aligned_ohlcv) < CONFIG.dynamic.min_samples:
+        return ohlcv, oi_history
+    return aligned_ohlcv, aligned_oi
+
+
 def get_top_symbols(limit: int) -> List[str]:
     """جلب أعلى عملات العقود الدائمة USDT-M من حيث حجم التداول."""
 
+    cache_key = "tickers"
     try:
-        tickers = exchange.fetch_tickers()
+        if not _cache_valid(cache_key):
+            _TICKERS_CACHE[cache_key] = (time.time(), request_with_retry(exchange.fetch_tickers))
+        tickers = _TICKERS_CACHE[cache_key][1]
         sorted_tickers = sorted(
             tickers.items(),
             key=lambda item: item[1].get("quoteVolume", 0),
@@ -121,12 +190,14 @@ def fetch_ohlcv_and_oi(symbol: str) -> Optional[Tuple[List[List[float]], List[Di
     """جلب OHLCV والـ OI التاريخي للرمز."""
 
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, CONFIG.timeframe, limit=CONFIG.lookback + 1)
-        oi_history = exchange.fetch_open_interest_history(
+        ohlcv = request_with_retry(exchange.fetch_ohlcv, symbol, CONFIG.timeframe, limit=CONFIG.lookback + 1)
+        oi_history = request_with_retry(
+            exchange.fetch_open_interest_history,
             symbol,
             CONFIG.timeframe,
             limit=CONFIG.lookback + 1,
         )
+        ohlcv, oi_history = align_by_timestamp(ohlcv, oi_history)
         if len(ohlcv) <= CONFIG.dynamic.min_samples or len(oi_history) <= CONFIG.dynamic.min_samples:
             print(f"⚠️ بيانات غير كافية لـ {symbol} - تم التجاوز")
             return None
@@ -140,7 +211,7 @@ def fetch_risk_metrics(symbol: str) -> Optional[Dict]:
     """جلب بيانات إضافية: سعر العقد، المؤشر، الأساس، التمويل، أحجام الشراء/البيع وغيرها."""
 
     try:
-        ticker = exchange.fetch_ticker(symbol)
+        ticker = request_with_retry(exchange.fetch_ticker, symbol)
 
         # أسعار رئيسية
         futures_price = float(ticker.get("last") or ticker.get("close"))
@@ -153,9 +224,19 @@ def fetch_risk_metrics(symbol: str) -> Optional[Dict]:
 
         # تمويل
         funding_rate = None
+        funding_history = []
         try:
-            funding = exchange.fetch_funding_rate(symbol)
+            funding = request_with_retry(exchange.fetch_funding_rate, symbol)
             funding_rate = float(funding.get("fundingRate")) if funding else None
+            funding_history_resp = request_with_retry(
+                exchange.fetch_funding_rate_history,
+                symbol,
+                None,
+                None,
+                CONFIG.dynamic.funding_history,
+            )
+            if funding_history_resp:
+                funding_history = [float(row.get("fundingRate") or 0) for row in funding_history_resp]
         except Exception:
             funding_rate = None
 
@@ -164,7 +245,10 @@ def fetch_risk_metrics(symbol: str) -> Optional[Dict]:
         try:
             endpoint = getattr(exchange, "fapiPublicGetTopLongShortAccountRatio", None)
             if endpoint:
-                resp = endpoint({"symbol": symbol.replace("/", ""), "period": CONFIG.long_short_period, "limit": 1})
+                resp = request_with_retry(
+                    endpoint,
+                    {"symbol": symbol.replace("/", ""), "period": CONFIG.long_short_period, "limit": 1},
+                )
                 if resp:
                     top_ratio = float(resp[0].get("longShortRatio"))
         except Exception:
@@ -180,6 +264,46 @@ def fetch_risk_metrics(symbol: str) -> Optional[Dict]:
         oi_value = float(ticker.get("info", {}).get("openInterestValue", 0))
         oi_to_liquidity = (oi_value / quote_volume) if quote_volume else None
 
+        # عمق دفتر الأوامر وفارق السبريد كمقياس للسيولة اللحظية
+        orderbook = request_with_retry(exchange.fetch_order_book, symbol, CONFIG.orderbook_limit)
+        bids = orderbook.get("bids", [])
+        asks = orderbook.get("asks", [])
+        top_bid = bids[0][0] if bids else None
+        top_ask = asks[0][0] if asks else None
+        spread_pct = ((top_ask - top_bid) / top_bid * 100) if top_bid and top_ask else None
+
+        def _depth(side: List[List[float]], levels: int = 10) -> float:
+            return sum([price * size for price, size in side[:levels]]) if side else 0.0
+
+        bid_depth = _depth(bids)
+        ask_depth = _depth(asks)
+        depth_ratio = (bid_depth / ask_depth) if ask_depth else None
+
+        # تدفقات التصفيات (إن وُجدت)
+        liquidations = []
+        try:
+            if getattr(exchange, "fetch_liquidations", None):
+                liq_resp = request_with_retry(
+                    exchange.fetch_liquidations,
+                    symbol,
+                    None,
+                    CONFIG.dynamic.liquidation_lookback,
+                    {"limit": CONFIG.dynamic.liquidation_lookback},
+                )
+                if isinstance(liq_resp, list):
+                    liquidations = liq_resp
+                elif isinstance(liq_resp, dict) and isinstance(liq_resp.get("data"), list):
+                    liquidations = liq_resp["data"]
+        except Exception:
+            liquidations = []
+
+        long_liq = sum(float(item.get("base", 0)) for item in liquidations if item.get("side") == "long")
+        short_liq = sum(float(item.get("base", 0)) for item in liquidations if item.get("side") == "short")
+
+        buy_pressure = bid_depth + taker_buy_quote
+        sell_pressure = ask_depth + taker_sell_quote
+        liquidity_score = (buy_pressure / sell_pressure) if sell_pressure else None
+
         return {
             "futures_price": futures_price,
             "mark_price": mark_price,
@@ -187,12 +311,20 @@ def fetch_risk_metrics(symbol: str) -> Optional[Dict]:
             "basis": basis,
             "basis_pct": basis_pct,
             "funding_rate": funding_rate,
+            "funding_history": funding_history,
             "top_long_short_ratio": top_ratio,
             "taker_buy_quote": taker_buy_quote,
             "taker_sell_quote": taker_sell_quote,
             "buy_sell_ratio": buy_sell_ratio,
             "oi_to_liquidity": oi_to_liquidity,
             "oi_value": oi_value,
+            "spread_pct": spread_pct,
+            "depth_ratio": depth_ratio,
+            "liquidity_score": liquidity_score,
+            "bid_depth": bid_depth,
+            "ask_depth": ask_depth,
+            "long_liquidations": long_liq,
+            "short_liquidations": short_liq,
         }
     except Exception as exc:  # noqa: BLE001
         print(f"⚠️ تعذر جلب مقاييس المخاطر لـ {symbol}: {exc}")
@@ -210,15 +342,21 @@ def compute_changes(
 ]:
     """يحسب التغيرات بالنسبة المئوية والتذبذب البسيط + سلاسل تاريخية."""
 
-    closes = [candle[4] for candle in ohlcv[-CONFIG.lookback :]]
-    price_returns = [((closes[i] - closes[i - 1]) / closes[i - 1]) * 100 for i in range(1, len(closes))]
+    closes_raw = [candle[4] for candle in ohlcv[-CONFIG.lookback :]]
+    oi_series_raw = [float(point["openInterestAmount"]) for point in oi_history[-CONFIG.lookback :]]
 
-    oi_series = [float(point["openInterestAmount"]) for point in oi_history[-CONFIG.lookback :]]
+    closes = filter_outliers(closes_raw, CONFIG.dynamic.outlier_sigma)
+    oi_series = filter_outliers(oi_series_raw, CONFIG.dynamic.outlier_sigma)
+
+    price_returns = [((closes[i] - closes[i - 1]) / closes[i - 1]) * 100 for i in range(1, len(closes))]
     oi_returns = [((oi_series[i] - oi_series[i - 1]) / oi_series[i - 1]) * 100 for i in range(1, len(oi_series))]
+
+    if not price_returns or not oi_returns:
+        return 0.0, 0.0, 0.0, price_returns, oi_returns
 
     price_change_pct = price_returns[-1]
     oi_change_pct = oi_returns[-1]
-    volatility = pstdev(closes) / closes[-1] * 100
+    volatility = (pstdev(closes) / closes[-1] * 100) if len(closes) > 1 else 0.0
 
     return (
         round(price_change_pct, 2),
@@ -242,6 +380,20 @@ def compute_trend(series: List[float], lookback: int) -> int:
     if short_avg < long_avg * 0.998:
         return -1
     return 0
+
+
+def multi_timeframe_trend(symbol: str) -> Dict[str, int]:
+    """حساب الترند عبر عدة أطر زمنية لإشارة أكثر موثوقية."""
+
+    trends: Dict[str, int] = {}
+    for tf in CONFIG.dynamic.multi_timeframes:
+        try:
+            ohlcv = request_with_retry(exchange.fetch_ohlcv, symbol, tf, limit=CONFIG.dynamic.price_trend_lookback + 20)
+            closes = [c[4] for c in ohlcv]
+            trends[tf] = compute_trend(closes, min(CONFIG.dynamic.price_trend_lookback, len(closes) - 1))
+        except Exception:
+            trends[tf] = 0
+    return trends
 
 
 def score_confidence(long_score: int, short_score: int, coverage: float) -> float:
@@ -355,12 +507,19 @@ def evaluate_signal(
     top_ratio = metrics.get("top_long_short_ratio")
     buy_sell_ratio = metrics.get("buy_sell_ratio")
     oi_to_liquidity = metrics.get("oi_to_liquidity")
+    spread_pct = metrics.get("spread_pct")
+    depth_ratio = metrics.get("depth_ratio")
+    liquidity_score = metrics.get("liquidity_score")
+    long_liq = metrics.get("long_liquidations")
+    short_liq = metrics.get("short_liquidations")
+    funding_history = metrics.get("funding_history", [])
 
     momentum = classify_momentum(price_chg, oi_chg)
     flash_event = detect_flash_event(price_chg, oi_chg, price_returns, oi_returns)
     # سلسلة الإغلاقات جاهزة بالفعل في metrics["ohlcv_closes"], لذا نمررها مباشرة لتفادي فهرسة غير صحيحة
     price_trend = compute_trend(metrics.get("ohlcv_closes", []) or [0], CONFIG.dynamic.price_trend_lookback)
     oi_trend = compute_trend(metrics.get("oi_series", []), CONFIG.dynamic.price_trend_lookback)
+    mtf_trends = metrics.get("mtf_trends", {})
 
     long_score = 0
     short_score = 0
@@ -373,11 +532,34 @@ def evaluate_signal(
         top_ratio is not None,
         buy_sell_ratio is not None,
         oi_to_liquidity is not None,
+        spread_pct is not None,
+        depth_ratio is not None,
         price_trend != 0,
         oi_trend != 0,
         momentum not in {"زخم جانبي/ضعيف"},
+        any(val != 0 for val in mtf_trends.values()) if mtf_trends else False,
     ]
     coverage_pct = (sum(coverage_checks) / len(coverage_checks)) * 100
+    missing_metrics = [
+        name
+        for flag, name in zip(
+            coverage_checks,
+            [
+                "basis",
+                "funding",
+                "top accounts",
+                "buy/sell ratio",
+                "oi/liquidity",
+                "spread",
+                "depth",
+                "price trend",
+                "oi trend",
+                "momentum",
+                "multi timeframe",
+            ],
+        )
+        if not flag
+    ]
 
     # ترجيح التمويل والأساس كعوامل تشبع/حذر
     if funding is not None:
@@ -390,6 +572,14 @@ def evaluate_signal(
         elif funding <= t.funding_extreme_low:
             notes.append("تمويل سلبي متطرف = تشبع بيعي")
             long_score += 2
+    if funding_history:
+        avg_funding = sum(funding_history) / len(funding_history)
+        if avg_funding > t.funding_high:
+            notes.append("متوسط تمويل مرتفع تاريخياً -> تشبع شرائي مزمن")
+            short_score += 1
+        if avg_funding < t.funding_extreme_low:
+            notes.append("متوسط تمويل سلبي حاد -> ضغط قصير محتمل")
+            long_score += 1
     if basis_pct >= t.basis_extreme_pos:
         notes.append("أساس موجب مرتفع (كونتانجو مبالغ)")
         short_score += 1
@@ -399,6 +589,29 @@ def evaluate_signal(
     if oi_to_liquidity and oi_to_liquidity >= t.oi_liquidity_hot:
         notes.append("رافعة مرتفعة: OI/السيولة في خطر")
         short_score += 1
+    if spread_pct and spread_pct > 0.25:
+        notes.append("سبريد عريض -> سيولة ضعيفة")
+        short_score += 1
+    if depth_ratio and depth_ratio > 1.5:
+        notes.append("عمق شراء يضغط للأعلى")
+        long_score += 1
+    elif depth_ratio and depth_ratio < 0.67:
+        notes.append("عمق بيع يضغط للأسفل")
+        short_score += 1
+    if liquidity_score and liquidity_score < 0.9:
+        notes.append("توازن السيولة ضعيف لصالح البائعين")
+        short_score += 1
+    elif liquidity_score and liquidity_score > 1.1:
+        notes.append("توازن السيولة لصالح المشترين")
+        long_score += 1
+
+    if long_liq or short_liq:
+        if long_liq > short_liq * 2:
+            notes.append("تصفية لونغات مرتفعة -> احتمالية ارتداد صعودي")
+            long_score += 1
+        elif short_liq > long_liq * 2:
+            notes.append("تصفية شورتات مرتفعة -> احتمالية تهدئة صعودية")
+            short_score += 1
 
     # تأثير نسبة كبار المتداولين مع القراءة المعاكسة عند التطرف
     if top_ratio is not None:
@@ -441,6 +654,16 @@ def evaluate_signal(
     elif oi_trend == -1:
         short_score += 1
         notes.append("ترند OI هابط = تفريغ مراكز")
+
+    if mtf_trends:
+        bull_count = sum(1 for v in mtf_trends.values() if v == 1)
+        bear_count = sum(1 for v in mtf_trends.values() if v == -1)
+        if bull_count >= 2:
+            notes.append("توافق أطر زمنية صعودي")
+            long_score += 2
+        elif bear_count >= 2:
+            notes.append("توافق أطر زمنية هبوطي")
+            short_score += 2
 
     if buy_sell_ratio:
         if buy_sell_ratio >= 1.2:
@@ -512,6 +735,9 @@ def evaluate_signal(
         joined = " | ".join(notes)
         return "⚪️ NEUTRAL/WAIT", joined, long_score, short_score, score_confidence(long_score, short_score, coverage_pct)
 
+    if missing_metrics:
+        notes.append("بيانات ناقصة: " + ", ".join(missing_metrics))
+
     # ترجيح نهائي مع حماية من التشبع المفرط
     if long_score > short_score + 1:
         return (
@@ -566,6 +792,7 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
         metrics = fetch_risk_metrics(symbol) or {}
         metrics["ohlcv_closes"] = [candle[4] for candle in ohlcv[-CONFIG.lookback :]]
         metrics["oi_series"] = [float(point["openInterestAmount"]) for point in oi_history[-CONFIG.lookback :]]
+        metrics["mtf_trends"] = multi_timeframe_trend(symbol)
         signal, rationale, long_score, short_score, confidence = evaluate_signal(
             price_chg,
             oi_chg,
@@ -582,6 +809,9 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
         funding_rate = metrics.get("funding_rate")
         top_ratio = metrics.get("top_long_short_ratio")
         oi_to_liquidity = metrics.get("oi_to_liquidity")
+        spread_pct = metrics.get("spread_pct")
+        depth_ratio = metrics.get("depth_ratio")
+        liquidity_score = metrics.get("liquidity_score")
 
         if signal != "NEUTRAL":
             row = [
@@ -594,6 +824,9 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
                 f"{funding_rate:.4f}" if funding_rate is not None else "-",
                 f"{top_ratio:.2f}" if top_ratio is not None else "-",
                 f"{oi_to_liquidity:.2f}" if oi_to_liquidity is not None else "-",
+                f"{spread_pct:.3f}%" if spread_pct is not None else "-",
+                f"{depth_ratio:.2f}" if depth_ratio is not None else "-",
+                f"{liquidity_score:.2f}" if liquidity_score is not None else "-",
                 str(long_score),
                 str(short_score),
                 f"{confidence}%",
@@ -637,6 +870,9 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
         "Funding",
         "Top L/S",
         "OI/Liq",
+        "Spread %",
+        "DepthR",
+        "LiqScore",
         "LScore",
         "SScore",
         "Conf %",
@@ -653,7 +889,7 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
         action = "ادخل شراء" if bias == "LONG" else "ادخل بيع"
         enriched: List[List[str]] = []
         for row in rows:
-            # row schema before: [symbol, price%, oi%, vol%, fut, basis, funding, top, oi/liquidity, L, S, Conf, momentum, flash, signal, reason]
+            # row schema before: [symbol, price%, oi%, vol%, fut, basis, funding, top, oi/liquidity, spread, depth, liqScore, L, S, Conf, momentum, flash, signal, reason]
             enriched.append(row[:-1] + [action, row[-1]])
         return enriched
 
