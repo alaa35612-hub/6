@@ -43,6 +43,7 @@ class Config:
     thresholds: Thresholds = Thresholds()
     dynamic: DynamicTuning = DynamicTuning()
     throttle_delay: float = 0.15
+    long_short_period: str = "5m"
 
 
 CONFIG = Config()
@@ -122,6 +123,69 @@ def fetch_ohlcv_and_oi(symbol: str) -> Optional[Tuple[List[List[float]], List[Di
         return None
 
 
+def fetch_risk_metrics(symbol: str) -> Optional[Dict]:
+    """جلب بيانات إضافية: سعر العقد، المؤشر، الأساس، التمويل، أحجام الشراء/البيع وغيرها."""
+
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+
+        # أسعار رئيسية
+        futures_price = float(ticker.get("last") or ticker.get("close"))
+        mark_price = float(ticker.get("info", {}).get("markPrice", futures_price))
+        index_price = float(ticker.get("info", {}).get("indexPrice", futures_price))
+
+        # الأساس = الفرق بين سعر العقود وسعر المؤشر
+        basis = futures_price - index_price
+        basis_pct = (basis / index_price) * 100 if index_price else 0.0
+
+        # تمويل
+        funding_rate = None
+        try:
+            funding = exchange.fetch_funding_rate(symbol)
+            funding_rate = float(funding.get("fundingRate")) if funding else None
+        except Exception:
+            funding_rate = None
+
+        # نسب المتداولين الكبار (إذا توفرت من واجهة بيانات بينانس)
+        top_ratio = None
+        try:
+            endpoint = getattr(exchange, "fapiPublicGetTopLongShortAccountRatio", None)
+            if endpoint:
+                resp = endpoint({"symbol": symbol.replace("/", ""), "period": CONFIG.long_short_period, "limit": 1})
+                if resp:
+                    top_ratio = float(resp[0].get("longShortRatio"))
+        except Exception:
+            top_ratio = None
+
+        # أحجام التكر و نسبة الشراء/البيع
+        quote_volume = float(ticker.get("quoteVolume") or 0)
+        taker_buy_quote = float(ticker.get("takerBuyQuoteVolume") or 0)
+        taker_sell_quote = max(quote_volume - taker_buy_quote, 0)
+        buy_sell_ratio = (taker_buy_quote / taker_sell_quote) if taker_sell_quote else None
+
+        # نسبة الفائدة المفتوحة للقيمة السوقية (نستخدم حجم التداول كبديل للسيولة)
+        oi_value = float(ticker.get("info", {}).get("openInterestValue", 0))
+        oi_to_liquidity = (oi_value / quote_volume) if quote_volume else None
+
+        return {
+            "futures_price": futures_price,
+            "mark_price": mark_price,
+            "index_price": index_price,
+            "basis": basis,
+            "basis_pct": basis_pct,
+            "funding_rate": funding_rate,
+            "top_long_short_ratio": top_ratio,
+            "taker_buy_quote": taker_buy_quote,
+            "taker_sell_quote": taker_sell_quote,
+            "buy_sell_ratio": buy_sell_ratio,
+            "oi_to_liquidity": oi_to_liquidity,
+            "oi_value": oi_value,
+        }
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️ تعذر جلب مقاييس المخاطر لـ {symbol}: {exc}")
+        return None
+
+
 def compute_changes(
     ohlcv: List[List[float]], oi_history: List[Dict]
 ) -> Tuple[
@@ -193,30 +257,56 @@ def evaluate_signal(
     volatility: float,
     price_returns: List[float],
     oi_returns: List[float],
+    metrics: Dict,
 ) -> Tuple[str, str]:
     """تطبيق قواعد الاستراتيجية وإرجاع الإشارة مع المبرر."""
 
     t = adjust_thresholds_dynamic(volatility, price_returns, oi_returns)
 
+    # إشارات تأكيد/إلغاء بناءً على الأساس والتمويل ونسبة المتداولين الكبار
+    basis_pct = metrics.get("basis_pct") or 0.0
+    funding = metrics.get("funding_rate")
+    top_ratio = metrics.get("top_long_short_ratio")
+    buy_sell_ratio = metrics.get("buy_sell_ratio")
+
     # 1) المصيدة الهبوطية (Trapped Longs)
     if t.bearish_price_limit_drop < price_chg < t.bearish_price_max_drop and oi_chg > t.bearish_oi_increase:
-        return "🔴 SHORT", "Sucker Pattern: Price flat/down + OI spiking"
+        rationale = "Sucker Pattern: Price flat/down + OI spiking"
+        if basis_pct > 0.5:
+            rationale += " | Basis مرتفع يدعم الهبوط"
+        if funding and funding > 0.01:
+            rationale += " | تمويل موجب مرتفع"
+        return "🔴 SHORT", rationale
 
     # 2) الانعكاس الصعودي (Capitulation)
     if price_chg < t.bullish_price_drop and oi_chg < t.bullish_oi_drop:
-        return "🟢 LONG", "Capitulation: Price & OI collapse"
+        rationale = "Capitulation: Price & OI collapse"
+        if funding and funding < 0:
+            rationale += " | تمويل سلبي يشجع الارتداد"
+        return "🟢 LONG", rationale
 
     # 3) إنهاك الاتجاه الصاعد
     if price_chg > 0 and oi_chg < t.exhaustion_oi_drop:
-        return "⚪️ EXIT/CAUTIOUS LONG", "Trend Exhaustion: Price up with falling OI"
+        rationale = "Trend Exhaustion: Price up with falling OI"
+        if basis_pct < -0.5:
+            rationale += " | Basis سلبي يقلل مخاطر الشراء"
+        return "⚪️ EXIT/CAUTIOUS LONG", rationale
 
     # 4) تأكيد المقاومة بالعالقين (Breakdown بدون خروج)
     if price_chg < t.bearish_price_limit_drop and oi_chg > 0:
-        return "🔴 SHORT", "Trapped Resistance: Breakdown without OI flush"
+        rationale = "Trapped Resistance: Breakdown without OI flush"
+        if top_ratio and top_ratio < 0.95:
+            rationale += " | كبار المتداولين يميلون للبيع"
+        return "🔴 SHORT", rationale
 
     # 5) ضغط شراء (Short squeeze محتمل)
     if price_chg > 1.0 and -1.5 <= oi_chg <= 0:
-        return "🟢 LONG", "Short squeeze fuel: Price rising while OI unwinds"
+        rationale = "Short squeeze fuel: Price rising while OI unwinds"
+        if funding and funding < 0:
+            rationale += " | تمويل سلبي يدعم squeeze"
+        if buy_sell_ratio and buy_sell_ratio > 1.2:
+            rationale += " | تفضيل شراء واضح"
+        return "🟢 LONG", rationale
 
     return "NEUTRAL", "-"
 
@@ -243,7 +333,13 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
         scanned += 1
         ohlcv, oi_history = payload
         price_chg, oi_chg, volatility, price_returns, oi_returns = compute_changes(ohlcv, oi_history)
-        signal, rationale = evaluate_signal(price_chg, oi_chg, volatility, price_returns, oi_returns)
+        metrics = fetch_risk_metrics(symbol) or {}
+        signal, rationale = evaluate_signal(price_chg, oi_chg, volatility, price_returns, oi_returns, metrics)
+
+        futures_price = metrics.get("futures_price")
+        basis_pct = metrics.get("basis_pct")
+        funding_rate = metrics.get("funding_rate")
+        top_ratio = metrics.get("top_long_short_ratio")
 
         if signal != "NEUTRAL":
             row = [
@@ -251,6 +347,10 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
                 f"{price_chg}%",
                 f"{oi_chg}%",
                 f"{volatility}%",
+                f"{futures_price}" if futures_price is not None else "-",
+                f"{basis_pct:.2f}%" if basis_pct is not None else "-",
+                f"{funding_rate:.4f}" if funding_rate is not None else "-",
+                f"{top_ratio:.2f}" if top_ratio is not None else "-",
                 signal,
                 rationale,
             ]
@@ -275,7 +375,18 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
     print(f"📊 تقرير التحليل - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 70)
 
-    headers = ["Symbol", "Price %", "OI %", "Vol %", "Signal", "Reason"]
+    headers = [
+        "Symbol",
+        "Price %",
+        "OI %",
+        "Vol %",
+        "Fut Px",
+        "Basis %",
+        "Funding",
+        "Top L/S",
+        "Signal",
+        "Reason",
+    ]
 
     if longs:
         print("\n🟢 فرص شراء محتملة (Long Candidates):")
@@ -293,6 +404,8 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
     print("- السعر ينخفض + OI يرتفع = إشارة هبوطية قوية")
     print("- السعر ينخفض بشدة + OI ينخفض بشدة = احتمال انعكاس صعودي")
     print("- السعر يرتفع + OI ينخفض = ضعف في الاتجاه الصاعد")
+    print("- Basis موجب + تمويل مرتفع + OI مرتفع = ضغط بيع محتمل")
+    print("- Basis سالب + تمويل سلبي + تفريغ OI = احتمالية ارتداد صعودي")
 
 
 # ==========================================
