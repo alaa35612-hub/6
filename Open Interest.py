@@ -57,6 +57,8 @@ class Config:
     timeframe: str = "15m"
     limit_coins: int = 200
     lookback: int = 50
+    oi_growth_filter_window: int = 12
+    oi_growth_min_pct: float = 5.0
     thresholds: Thresholds = Thresholds()
     dynamic: DynamicTuning = DynamicTuning()
     throttle_delay: float = 0.15
@@ -167,6 +169,19 @@ def align_by_timestamp(ohlcv: List[List[float]], oi_history: List[Dict]) -> Tupl
     if len(aligned_ohlcv) < CONFIG.dynamic.min_samples:
         return ohlcv, oi_history
     return aligned_ohlcv, aligned_oi
+
+
+def compute_oi_growth(oi_series: List[float], window: int) -> Optional[float]:
+    """حساب نسبة نمو الفائدة المفتوحة خلال نافذة قابلة للتخصيص."""
+
+    if window <= 0 or len(oi_series) <= window:
+        return None
+
+    start_val = oi_series[-(window + 1)]
+    end_val = oi_series[-1]
+    if start_val == 0:
+        return None
+    return round(((end_val - start_val) / start_val) * 100, 2)
 
 
 def get_top_symbols(limit: int) -> List[str]:
@@ -806,6 +821,19 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
         metrics = fetch_risk_metrics(symbol) or {}
         metrics["ohlcv_closes"] = [candle[4] for candle in ohlcv[-CONFIG.lookback :]]
         metrics["oi_series"] = [float(point["openInterestAmount"]) for point in oi_history[-CONFIG.lookback :]]
+        metrics["oi_growth_window_pct"] = compute_oi_growth(
+            metrics["oi_series"], CONFIG.oi_growth_filter_window
+        )
+        if (
+            CONFIG.oi_growth_filter_window > 0
+            and CONFIG.oi_growth_min_pct is not None
+            and metrics["oi_growth_window_pct"] is not None
+            and metrics["oi_growth_window_pct"] < CONFIG.oi_growth_min_pct
+        ):
+            print(
+                f"⏭️ تجاوز {symbol}: نمو OI {metrics['oi_growth_window_pct']}% أقل من الحد {CONFIG.oi_growth_min_pct}%"
+            )
+            continue
         metrics["mtf_trends"] = multi_timeframe_trend(symbol)
         signal, rationale, long_score, short_score, confidence = evaluate_signal(
             price_chg,
@@ -817,6 +845,8 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
         )
         momentum = classify_momentum(price_chg, oi_chg)
         flash = detect_flash_event(price_chg, oi_chg, price_returns, oi_returns)
+
+        oi_growth_window = metrics.get("oi_growth_window_pct")
 
         futures_price = metrics.get("futures_price")
         basis_pct = metrics.get("basis_pct")
@@ -832,6 +862,7 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
                 symbol,
                 f"{price_chg}%",
                 f"{oi_chg}%",
+                f"{oi_growth_window:.2f}%" if oi_growth_window is not None else "-",
                 f"{volatility}%",
                 f"{futures_price}" if futures_price is not None else "-",
                 f"{basis_pct:.2f}%" if basis_pct is not None else "-",
@@ -857,8 +888,8 @@ def analyze_market() -> Tuple[List[List[str]], List[List[str]]]:
         time.sleep(CONFIG.throttle_delay)
 
     # ترتيب المخرجات تنازلياً حسب قوة/ثقة الإشارة
-    longs.sort(key=lambda r: float(r[11].replace("%", "")), reverse=True)
-    shorts.sort(key=lambda r: float(r[11].replace("%", "")), reverse=True)
+    longs.sort(key=lambda r: float(r[15].replace("%", "")), reverse=True)
+    shorts.sort(key=lambda r: float(r[15].replace("%", "")), reverse=True)
 
     print(f"\n✅ تم فحص {scanned} أزواج بعينات كافية من أصل {len(symbols)}")
     return longs, shorts
@@ -878,6 +909,7 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
         "Symbol",
         "Price %",
         "OI %",
+        "OI Win %",
         "Vol %",
         "Fut Px",
         "Basis %",
@@ -903,7 +935,7 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
         action = "ادخل شراء" if bias == "LONG" else "ادخل بيع"
         enriched: List[List[str]] = []
         for row in rows:
-            # row schema before: [symbol, price%, oi%, vol%, fut, basis, funding, top, oi/liquidity, spread, depth, liqScore, L, S, Conf, momentum, flash, signal, reason]
+            # row schema before: [symbol, price%, oi%, oi_window%, vol%, fut, basis, funding, top, oi/liquidity, spread, depth, liqScore, L, S, Conf, momentum, flash, signal, reason]
             enriched.append(row[:-1] + [action, row[-1]])
         return enriched
 
@@ -938,14 +970,14 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
         for row in annotate(longs, "LONG"):
             symbol, lscore, sscore, conf, momentum, flash, signal, action, reason = (
                 row[0],
-                row[9],
-                row[10],
-                row[11],
-                row[12],
                 row[13],
                 row[14],
                 row[15],
                 row[16],
+                row[17],
+                row[18],
+                row[19],
+                row[20],
             )
             print(
                 f"✅ {symbol}: {action} | {signal} | ثقة {conf} | L:{lscore} / S:{sscore} | {momentum} | {flash} | {reason}"
@@ -953,14 +985,14 @@ def render_report(longs: List[List[str]], shorts: List[List[str]]) -> None:
         for row in annotate(shorts, "SHORT"):
             symbol, lscore, sscore, conf, momentum, flash, signal, action, reason = (
                 row[0],
-                row[9],
-                row[10],
-                row[11],
-                row[12],
                 row[13],
                 row[14],
                 row[15],
                 row[16],
+                row[17],
+                row[18],
+                row[19],
+                row[20],
             )
             print(
                 f"⚠️ {symbol}: {action} | {signal} | ثقة {conf} | L:{lscore} / S:{sscore} | {momentum} | {flash} | {reason}"
